@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <clipPath id="huFlagClip">
+      <rect x="84" y="350" width="344" height="72" rx="14" />
+    </clipPath>
+  </defs>
+
+  <!-- Outer Clean White TV Frame (#ececec) on Black (#050505) -->
+  <rect x="20" y="20" width="472" height="472" rx="96" fill="#050505" stroke="#ececec" stroke-width="18" />
+  <rect x="52" y="52" width="408" height="408" rx="68" fill="#0c0c0c" stroke="#2a2a2a" stroke-width="6" />
+
+  <!-- Tall Horizontal Hungarian Flag at Bottom (72px tall: 24px Red, 24px White, 24px Green) -->
+  <g clip-path="url(#huFlagClip)">
+    <rect x="84" y="350" width="344" height="24" fill="#dc2626" />
+    <rect x="84" y="374" width="344" height="24" fill="#f8fafc" />
+    <rect x="84" y="398" width="344" height="24" fill="#16a34a" />
+  </g>
+
+  <!-- Bold High-Contrast 'H' -->
+  <path d="M84 120 H124 V198 H182 V120 H222 V312 H182 V234 H124 V312 H84 Z" fill="#ececec" />
+  <!-- Bold High-Contrast 'U' -->
+  <path d="M242 120 H282 V246 C282 268 294 280 312 280 C330 280 342 268 342 246 V120 H382 V246 C382 292 354 316 312 316 C270 316 242 292 242 246 Z" fill="#ececec" />
+
+  <!-- Hungarian Crimson Red Play Triangle -->
+  <polygon points="398,158 452,216 398,274" fill="#dc2626" />
+</svg>

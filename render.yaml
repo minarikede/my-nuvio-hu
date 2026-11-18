@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: nuvio-magyar-http
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node --max-old-space-size=220 --max-semi-space-size=8 server.js
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NETMOZI_REMOTE
+        value: "1"
+      - key: NODE_OPTIONS
+        value: "--max-old-space-size=220 --max-semi-space-size=8"
+      - key: MALLOC_ARENA_MAX
+        value: "2"

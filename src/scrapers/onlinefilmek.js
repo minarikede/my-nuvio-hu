@@ -1,0 +1,380 @@
+const { extractVoeDirectStreams } = require('../utils/crypto_decoders');
+/**
+ * OnlineFilmekIngyen1.com Scraper
+ * Uses DooPlay search, REST API (dooplayer/v2) and AJAX player options to resolve video sources (Videa, VOE, Filemoon, etc.).
+ */
+
+const { extractOkRuStreams, resolveVideaEmbed } = require('./filmezek');
+const { extractIndavideoStreams } = require('./indavideo');
+const { isValidRuntime, checkPageMetadata } = require('./videa');
+
+function normalize(str) {
+  return (str || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function findBestDooPlayItem(results, meta) {
+  if (!results || typeof results !== 'object') return null;
+  const targetHu = normalize(meta.hungarianTitle);
+  const targetEn = normalize(meta.englishTitle);
+  const targetYear = meta.year ? parseInt(meta.year, 10) : null;
+  const isSeries = !!meta.season;
+
+  let bestItem = null;
+  let bestScore = -1;
+
+  for (const key of Object.keys(results)) {
+    const item = results[key];
+    if (!item || !item.url) continue;
+
+    const isTvShow = item.url.includes('/tvshows/');
+
+    // Check media type
+    if (isSeries && !isTvShow) continue;
+    if (!isSeries && isTvShow) continue;
+
+    const itemTitle = normalize(item.title);
+    const itemYear = item.extra?.date ? parseInt(item.extra.date, 10) : null;
+
+    let score = 0;
+
+    // Check title match
+    if (itemTitle === targetHu || (targetEn && itemTitle === targetEn)) {
+      score += 100;
+    } else if (itemTitle.startsWith(targetHu) || targetHu.startsWith(itemTitle)) {
+      score += 60;
+    } else {
+      const targetWords = new Set(targetHu.split(' ').filter(w => w.length > 2));
+      const itemWords = new Set(itemTitle.split(' ').filter(w => w.length > 2));
+      let overlap = 0;
+      for (const w of targetWords) {
+        if (itemWords.has(w)) overlap++;
+      }
+      if (overlap === 0) continue; // Completely unrelated title
+      score += (overlap / Math.max(targetWords.size, 1)) * 40;
+    }
+
+    // Check year match (strict ±1 year for movies)
+    if (targetYear && itemYear) {
+      if (itemYear === targetYear) {
+        score += 50;
+      } else if (Math.abs(itemYear - targetYear) <= 1) {
+        score += 20;
+      } else if (!isSeries) {
+        continue; // Hard-reject wrong-year movie remakes
+      } else {
+        score -= 70;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestItem = item;
+    }
+  }
+
+  return bestScore >= 40 ? bestItem : null;
+}
+
+function formatHosterStream(embedUrl, movieTitle, providerName = 'OnlineFilmek') {
+  const locLower = embedUrl.toLowerCase();
+  let hosterName = 'Hoster';
+  let height = 720;
+  let finalUrl = embedUrl.replace(/&amp;/g, '&');
+
+  if (locLower.includes('filemoon')) {
+    const fmMatch = embedUrl.match(/filemoon\.(?:sx|to|nl|wf|com)\/(?:e\/|d\/)?([a-zA-Z0-9]+)/i);
+    hosterName = 'Filemoon';
+    if (fmMatch) finalUrl = `https://filemoon.sx/e/${fmMatch[1]}`;
+  } else if (locLower.includes('voe.sx') || locLower.includes('voe-network') || locLower.includes('voe.')) {
+    const voeMatch = embedUrl.match(/voe\.(?:sx|net|to)\/(?:e\/)?([a-zA-Z0-9]+)/i);
+    hosterName = 'VOE';
+    if (voeMatch) finalUrl = `https://voe.sx/e/${voeMatch[1]}`;
+  } else if (locLower.includes('vidmoly')) {
+    const molyMatch = embedUrl.match(/vidmoly\.(?:to|me|net)\/(?:embed-|w\/)?([a-zA-Z0-9]+)/i);
+    hosterName = 'Vidmoly';
+    if (molyMatch) finalUrl = `https://vidmoly.to/embed-${molyMatch[1]}.html`;
+  } else if (locLower.includes('streamruby') || locLower.includes('rubystream')) {
+    const rubyMatch = embedUrl.match(/(?:streamruby|rubystream)\.(?:com|net)\/(?:embed-|e\/)?([a-zA-Z0-9]+)/i);
+    hosterName = 'StreamRuby';
+    if (rubyMatch) finalUrl = `https://streamruby.com/embed-${rubyMatch[1]}.html`;
+  } else if (locLower.includes('streamwish')) {
+    const wishMatch = embedUrl.match(/streamwish\.(?:to|com)\/(?:e\/)?([a-zA-Z0-9]+)/i);
+    hosterName = 'Streamwish';
+    if (wishMatch) finalUrl = `https://streamwish.to/e/${wishMatch[1]}`;
+  } else if (locLower.includes('dood')) {
+    hosterName = 'DoodStream';
+  } else if (locLower.includes('mixdrop')) {
+    hosterName = 'Mixdrop';
+  } else {
+    try {
+      const u = new URL(embedUrl);
+      hosterName = u.hostname.replace(/^www\./, '');
+    } catch (e) {}
+  }
+
+  const qualBadge = height >= 1080 ? '1080p FHD' : '720p HD';
+  return {
+    name: `[HU] ${providerName} (${hosterName}) ${qualBadge}`,
+    title: `${movieTitle} [${qualBadge}]\n🇭🇺 ${providerName} / ${hosterName} • Szinkron • Közvetlen Lejátszó`,
+    url: finalUrl,
+    playerUrl: finalUrl,
+    quality: height >= 1080 ? '1080p' : '720p',
+    height,
+    source: providerName.toLowerCase(),
+    behaviorHints: { bingeGroup: `hu-${providerName.toLowerCase()}-${hosterName.toLowerCase()}` }
+  };
+}
+
+async function resolveDooPlayPlayer(post, nume, type, referer) {
+  // 1. Try modern wp-json/dooplayer/v2/ endpoint first (super fast)
+  try {
+    const v2Url = `https://www.onlinefilmekingyen1.com/wp-json/dooplayer/v2/${post}/${type}/${nume}`;
+    const res = await fetch(v2Url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Referer': referer
+      },
+      signal: AbortSignal.timeout(4000)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.embed_url) return data.embed_url;
+    }
+  } catch (err) {}
+
+  // 2. Fallback to admin-ajax.php
+  try {
+    const body = new URLSearchParams({
+      action: 'doo_player_ajax',
+      post: post.toString(),
+      nume: nume.toString(),
+      type: type || 'movie'
+    });
+
+    const res = await fetch('https://www.onlinefilmekingyen1.com/wp-admin/admin-ajax.php', {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': referer,
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+      },
+      body: body.toString(),
+      signal: AbortSignal.timeout(4000)
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      return data?.embed_url || null;
+    }
+  } catch (err) {}
+
+  return null;
+}
+
+async function scrapeOnlineFilmek(meta) {
+  const streams = [];
+  const searchTerms = [];
+
+  const hu = meta.hungarianTitle || meta.englishTitle;
+  if (!hu) return streams;
+
+  searchTerms.push(hu);
+  const strippedHu = hu.replace(/^(?:A|Az)\s+/i, '');
+  if (strippedHu !== hu) searchTerms.push(strippedHu);
+
+  if (meta.englishTitle && meta.englishTitle !== hu) {
+    searchTerms.push(meta.englishTitle);
+    const strippedEn = meta.englishTitle.replace(/^(?:The|A|An)\s+/i, '');
+    if (strippedEn !== meta.englishTitle) searchTerms.push(strippedEn);
+  }
+
+  const seenUrls = new Set();
+
+  for (const term of searchTerms) {
+    try {
+      let itemUrl = null;
+      let postTitle = '';
+
+      // 1. DooPlay search API with title & year verification
+      const apiUrl = `https://www.onlinefilmekingyen1.com/wp-json/dooplay/search/?keyword=${encodeURIComponent(term)}&nonce=7b089995bb`;
+      try {
+        const apiRes = await fetch(apiUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Referer': 'https://www.onlinefilmekingyen1.com/'
+          },
+          signal: AbortSignal.timeout(4000)
+        });
+        if (apiRes.ok) {
+          const results = await apiRes.json();
+          const matched = findBestDooPlayItem(results, meta);
+          if (matched) {
+            itemUrl = matched.url;
+            postTitle = matched.title;
+          }
+        }
+      } catch (e) {
+        // Fallback to standard WP search
+      }
+
+      // 2. Fallback search via HTML if API failed
+      if (!itemUrl) {
+        const wpSearchUrl = `https://www.onlinefilmekingyen1.com/?s=${encodeURIComponent(term)}`;
+        const wpRes = await fetch(wpSearchUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+          },
+          signal: AbortSignal.timeout(4000)
+        });
+        if (wpRes.ok) {
+          const wpHtml = await wpRes.text();
+          const resultBlocks = [...wpHtml.matchAll(/<article[^>]*>([\s\S]*?)<\/article>/gi)];
+          const targetYear = meta.year ? parseInt(meta.year, 10) : null;
+          for (const rb of resultBlocks) {
+            const blockHtml = rb[1];
+            const tMatch = blockHtml.match(/<div class="title">\s*<a href="([^"]+)">([^<]+)<\/a>/i);
+            if (!tMatch) continue;
+            const mUrl = tMatch[1];
+            const mTitle = tMatch[2];
+            const yMatch = blockHtml.match(/<span class="year">\s*(\d{4})\s*<\/span>/i);
+            const mYear = yMatch ? parseInt(yMatch[1], 10) : null;
+
+            if (!meta.season && targetYear && mYear && Math.abs(mYear - targetYear) > 1) {
+              continue;
+            }
+
+            const normMTitle = normalize(mTitle);
+            const normHu = normalize(hu);
+            if (isTitleMatch(hu, mTitle, meta.year, Boolean(meta.season))) {
+              itemUrl = mUrl;
+              postTitle = mTitle;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!itemUrl) continue;
+
+      // If it's a TV series, convert show url to episode url
+      let targetUrl = itemUrl;
+      if (meta.season && meta.episode) {
+        const slugMatch = itemUrl.match(/\/tvshows\/([^/]+)\//);
+        if (slugMatch) {
+          const slug = slugMatch[1];
+          targetUrl = `https://www.onlinefilmekingyen1.com/episodes/${slug}-${meta.season}x${meta.episode}/`;
+        }
+      }
+
+      const pageRes = await fetch(targetUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        },
+        signal: AbortSignal.timeout(5000)
+      });
+      if (!pageRes.ok) continue;
+
+      const pageHtml = await pageRes.text();
+      if (!meta.season) {
+        const pageCheck = checkPageMetadata(pageHtml, meta);
+        if (!pageCheck.match) continue;
+      }
+
+      // Resolve player options in parallel instead of sequentially
+      const optionMatches = [...pageHtml.matchAll(/data-type=['"]([^'"]+)['"]\s+data-post=['"]([^'"]+)['"]\s+data-nume=['"]([^'"]+)['"]/g)];
+      const embedUrls = await Promise.all(
+        optionMatches
+          .filter(m => m[3] !== 'trailer')
+          .slice(0, 5)
+          .map(m => resolveDooPlayPlayer(m[2], m[3], m[1], targetUrl).catch(() => null))
+      );
+
+      await Promise.allSettled(embedUrls.map(async (embedUrl) => {
+        if (!embedUrl || seenUrls.has(embedUrl)) return;
+        seenUrls.add(embedUrl);
+
+        // 1. Check if Videa embed -> decode to direct MP4
+        if (embedUrl.includes('videa.hu')) {
+          const vSources = await resolveVideaEmbed(embedUrl);
+          for (const vs of vSources) {
+            const qualLabel = vs.height >= 1080 ? '1080p FHD' : vs.height >= 720 ? '720p HD' : `${vs.height}p`;
+            streams.push({
+              name: `[HU] OnlineFilmek (Videa) ${qualLabel}`,
+              title: `${postTitle || hu}\n🇭🇺 OnlineFilmekIngyen (Videa) • ${qualLabel} • Szinkron`,
+              url: vs.url,
+              quality: vs.height >= 1080 ? '1080p' : vs.height >= 720 ? '720p' : '480p',
+              height: vs.height,
+              source: 'onlinefilmek',
+              behaviorHints: { bingeGroup: `hu-onlinefilmek-videa-${qualLabel}` }
+            });
+          }
+          if (vSources.length > 0) return;
+        }
+
+        // 2. Check if Indavideo embed -> decode to direct MP4
+        if (embedUrl.includes('indavideo.hu')) {
+          const iMatch = embedUrl.match(/(?:video\/|v\/)([a-zA-Z0-9]+)/);
+          if (iMatch) {
+            const iData = await extractIndavideoStreams(iMatch[1]);
+            for (const is of (iData?.streams || [])) {
+              const qualLabel = is.height >= 1080 ? '1080p FHD' : is.height >= 720 ? '720p HD' : `${is.height}p`;
+              streams.push({
+                name: `[HU] OnlineFilmek (Indavideo) ${qualLabel}`,
+                title: `${postTitle || hu}\n🇭🇺 OnlineFilmekIngyen (Indavideo) • ${qualLabel} • Szinkron`,
+                url: is.url,
+                quality: is.height >= 1080 ? '1080p' : is.height >= 720 ? '720p' : '480p',
+                height: is.height,
+                source: 'onlinefilmek',
+                behaviorHints: { bingeGroup: `hu-onlinefilmek-indavideo-${qualLabel}` }
+              });
+            }
+          }
+          return;
+        }
+
+        // 3. Check if OK.ru embed -> decode to direct MP4/HLS
+        if (embedUrl.includes('ok.ru/videoembed/') || embedUrl.includes('ok.ru/video/')) {
+          const okStreams = await extractOkRuStreams(embedUrl, 'OnlineFilmek', meta);
+          streams.push(...okStreams);
+          return;
+        }
+
+        // 3b. Check if VOE embed -> decode direct HLS/MP4 on Self-Host
+        if (embedUrl.includes('voe.sx') || embedUrl.includes('voe.')) {
+          const voeStreams = await extractVoeDirectStreams(embedUrl, 'OnlineFilmek', postTitle || hu, 'onlinefilmek');
+          streams.push(...voeStreams);
+          return;
+        }
+
+        // 4. Direct video file (.mp4, .m3u8) only — never return HTML iframe embeds that cause infinite buffering in Nuvio
+        if (embedUrl.includes('.mp4') || embedUrl.includes('.m3u8')) {
+          streams.push({
+            name: `[HU] OnlineFilmek 720p HD`,
+            title: `${postTitle || hu}\n🇭🇺 OnlineFilmekIngyen • 720p HD • Szinkron`,
+            url: embedUrl,
+            quality: '720p',
+            height: 720,
+            source: 'onlinefilmek'
+          });
+        }
+      }));
+
+      if (streams.length > 0) break;
+    } catch (e) {
+      // Continue
+    }
+  }
+
+  return streams;
+}
+
+module.exports = {
+  scrapeOnlineFilmek
+};
